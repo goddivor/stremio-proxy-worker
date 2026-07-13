@@ -1,0 +1,214 @@
+// ===========================================================================
+// Proxy vidéo Stremio — version Deno Deploy.
+//
+// Identique au Cloudflare Worker, MAIS le CDN Vidmoly (vmwesa) accepte l'IP de
+// Deno Deploy (il bloque Cloudflare). C'est donc ce proxy qui sert voiranime /
+// Vidmoly. Bande passante gratuite : 100 Go/mois.
+//
+// Routes (mêmes jetons base64url que les addons) :
+//   /hls/{token}.m3u8|.ts       proxy HLS (playlists réécrites + segments)
+//   /mp4/{token}.mp4            proxy MP4 avec Range
+//   /vidmoly/{embed64}.m3u8    extrait Vidmoly PUIS proxifie (même IP)
+//   /streamtape/{embed64}.mp4  extrait StreamTape PUIS proxifie (même IP)
+// ===========================================================================
+
+import { Buffer } from "node:buffer";
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+const CLIENT_HINTS = {
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+  "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
+
+function browserHeaders(referer) {
+  const origin = new URL(referer).origin;
+  return { "User-Agent": USER_AGENT, ...CLIENT_HINTS, Referer: referer, Origin: origin };
+}
+
+const HLS_PREFIX = "/hls/";
+const MP4_PREFIX = "/mp4/";
+const VIDMOLY_PREFIX = "/vidmoly/";
+const STREAMTAPE_PREFIX = "/streamtape/";
+
+const b64d = (t) => Buffer.from(t, "base64url").toString("utf8");
+
+function decodeToken(token) {
+  return JSON.parse(Buffer.from(token, "base64url").toString("utf8"));
+}
+function encodeToken(target, referer) {
+  return Buffer.from(JSON.stringify({ u: target, r: referer }), "utf8").toString("base64url");
+}
+
+// ----------------------------- HLS -----------------------------------------
+
+function proxyChild(rawUrl, baseUrl, referer, origin) {
+  const abs = new URL(rawUrl, baseUrl).href;
+  const isPlaylist = new URL(abs).pathname.endsWith(".m3u8");
+  const ext = isPlaylist ? ".m3u8" : ".ts";
+  return `${origin}${HLS_PREFIX}${encodeToken(abs, referer)}${ext}`;
+}
+
+function rewritePlaylist(text, baseUrl, referer, origin) {
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith("#")) {
+        return line.replace(
+          /URI="([^"]+)"/g,
+          (_m, uri) => `URI="${proxyChild(uri, baseUrl, referer, origin)}"`
+        );
+      }
+      return proxyChild(trimmed, baseUrl, referer, origin);
+    })
+    .join("\n");
+}
+
+async function handleHls(request, path, origin) {
+  const token = path.slice(HLS_PREFIX.length).replace(/\.(m3u8|ts)$/, "");
+  const { u: target, r: referer } = decodeToken(token);
+  const upstream = await fetch(target, { headers: browserHeaders(referer) });
+  if (!upstream.ok) return new Response(null, { status: upstream.status });
+  const isPlaylist = new URL(target).pathname.endsWith(".m3u8");
+  if (isPlaylist) {
+    const text = await upstream.text();
+    return new Response(rewritePlaylist(text, target, referer, origin), {
+      status: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "no-cache",
+      },
+    });
+  }
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": upstream.headers.get("content-type") || "video/MP2T",
+      "Cache-Control": "public, max-age=86400",
+    },
+  });
+}
+
+// ----------------------------- MP4 -----------------------------------------
+
+async function handleMp4(request, path) {
+  const token = path.slice(MP4_PREFIX.length).replace(/\.mp4$/, "");
+  const { u: target, r: referer } = decodeToken(token);
+  const range = request.headers.get("Range");
+  const upstream = await fetch(target, {
+    headers: { "User-Agent": USER_AGENT, Referer: referer, Range: range || "bytes=0-" },
+    redirect: "follow",
+  });
+  const headers = new Headers();
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Type", upstream.headers.get("content-type") || "video/mp4");
+  const contentRange = upstream.headers.get("content-range");
+  if (range && contentRange) {
+    headers.set("Content-Range", contentRange);
+    const len = upstream.headers.get("content-length");
+    if (len) headers.set("Content-Length", len);
+  } else if (contentRange) {
+    const total = contentRange.split("/")[1];
+    if (total) headers.set("Content-Length", total);
+  }
+  return new Response(upstream.body, { status: range ? upstream.status : 200, headers });
+}
+
+// ------------------------- Vidmoly (extraction) ----------------------------
+
+async function extractVidmolyMaster(embedUrl) {
+  const host = new URL(embedUrl).host;
+  const referer = `https://${host}/`;
+  const html = await (
+    await fetch(embedUrl, { headers: { ...browserHeaders(referer), "Sec-Fetch-Dest": "iframe" } })
+  ).text();
+  const block = html.match(/sources:\s*(\[[\s\S]*?\])/);
+  const scope = block ? block[1] : html;
+  const m = scope.match(/file:\s*["']([^"']+\.m3u8[^"']*)["']/);
+  return m ? { master: m[1], referer } : null;
+}
+
+async function handleVidmoly(request, path, origin) {
+  const embedUrl = b64d(path.slice(VIDMOLY_PREFIX.length).replace(/\.m3u8$/, ""));
+  const ext = await extractVidmolyMaster(embedUrl);
+  if (!ext) return new Response(null, { status: 502 });
+  const upstream = await fetch(ext.master, { headers: browserHeaders(ext.referer) });
+  if (!upstream.ok) return new Response(null, { status: upstream.status });
+  const text = await upstream.text();
+  return new Response(rewritePlaylist(text, ext.master, ext.referer, origin), {
+    status: 200,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+
+// ----------------------- StreamTape (extraction) ---------------------------
+
+async function extractStreamtapeUrl(embedUrl) {
+  const EMBED_BASE = "https://streamtape.com/e/";
+  let url = embedUrl;
+  if (!url.startsWith(EMBED_BASE)) {
+    const id = url.split("/")[4];
+    if (!id) return null;
+    url = EMBED_BASE + id;
+  }
+  const html = await (
+    await fetch(url, { headers: { "User-Agent": USER_AGENT, Referer: "https://streamtape.com/" } })
+  ).text();
+  const m = html.match(/robotlink'\)\.innerHTML\s*=\s*'([^']*)'\s*\+\s*\('xcd([^']*)'/);
+  return m ? "https:" + m[1] + m[2] : null;
+}
+
+async function handleStreamtape(request, path) {
+  const embedUrl = b64d(path.slice(STREAMTAPE_PREFIX.length).replace(/\.mp4$/, ""));
+  const videoUrl = await extractStreamtapeUrl(embedUrl);
+  if (!videoUrl) return new Response(null, { status: 502 });
+  const range = request.headers.get("Range");
+  const upstream = await fetch(videoUrl, {
+    headers: { "User-Agent": USER_AGENT, Referer: "https://streamtape.com/", Range: range || "bytes=0-" },
+    redirect: "follow",
+  });
+  const headers = new Headers();
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Content-Type", upstream.headers.get("content-type") || "video/mp4");
+  const contentRange = upstream.headers.get("content-range");
+  if (range && contentRange) {
+    headers.set("Content-Range", contentRange);
+    const len = upstream.headers.get("content-length");
+    if (len) headers.set("Content-Length", len);
+  } else if (contentRange) {
+    const total = contentRange.split("/")[1];
+    if (total) headers.set("Content-Length", total);
+  }
+  return new Response(upstream.body, { status: range ? upstream.status : 200, headers });
+}
+
+// ----------------------------- Entrée (Deno) -------------------------------
+
+Deno.serve(async (request) => {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  try {
+    if (path.startsWith(HLS_PREFIX)) return await handleHls(request, path, url.origin);
+    if (path.startsWith(MP4_PREFIX)) return await handleMp4(request, path);
+    if (path.startsWith(VIDMOLY_PREFIX)) return await handleVidmoly(request, path, url.origin);
+    if (path.startsWith(STREAMTAPE_PREFIX)) return await handleStreamtape(request, path);
+    return new Response("Stremio video proxy (Deno) — OK", { status: 200 });
+  } catch (err) {
+    return new Response("proxy error: " + err.message, { status: 502 });
+  }
+});
