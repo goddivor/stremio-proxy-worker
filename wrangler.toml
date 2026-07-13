@@ -6,9 +6,5 @@ compatibility_date = "2024-09-23"
 # nodejs_compat : donne accès à Buffer (décodage des jetons base64url comme les addons).
 compatibility_flags = ["nodejs_compat"]
 
-# --- Domaine personnalisé (optionnel) ---
-# Par défaut le Worker est servi sur https://stremio-proxy.<ton-sous-domaine>.workers.dev
-# Pour utiliser proxy.anadeb.tg à la place, décommente et adapte :
-# routes = [
-#   { pattern = "proxy.anadeb.tg", custom_domain = true }
-# ]
+# Le Worker est servi sur https://stremio-proxy.<ton-sous-domaine>.workers.dev
+# (sous-domaine workers.dev gratuit, à enregistrer une fois pour le compte).
