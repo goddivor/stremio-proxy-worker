@@ -1,0 +1,13 @@
+{
+  "name": "stremio-proxy-worker",
+  "version": "1.0.0",
+  "description": "Proxy vidéo Stremio sur Cloudflare Workers (HLS + MP4) — bande passante gratuite",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
