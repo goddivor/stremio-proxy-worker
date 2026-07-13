@@ -16,7 +16,24 @@
 // ===========================================================================
 
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// En-têtes navigateur complets. Les Client Hints (sec-ch-ua) sont INDISPENSABLES :
+// sans eux, Vidmoly refuse les requêtes venant de Cloudflare (403). Avec, ça passe.
+const CLIENT_HINTS = {
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+  "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
+
+/** En-têtes complets pour une requête vers un hôte donné. */
+function browserHeaders(referer) {
+  const origin = new URL(referer).origin;
+  return { "User-Agent": USER_AGENT, ...CLIENT_HINTS, Referer: referer, Origin: origin };
+}
 
 const HLS_PREFIX = "/hls/";
 const MP4_PREFIX = "/mp4/";
@@ -68,13 +85,7 @@ async function handleHls(request, path, origin) {
   const token = tokenWithExt.replace(/\.(m3u8|ts)$/, "");
   const { u: target, r: referer } = decodeToken(token);
 
-  const upstream = await fetch(target, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Referer: referer,
-      Origin: new URL(referer).origin,
-    },
-  });
+  const upstream = await fetch(target, { headers: browserHeaders(referer) });
   if (!upstream.ok) return new Response(null, { status: upstream.status });
 
   const isPlaylist = new URL(target).pathname.endsWith(".m3u8");
@@ -144,14 +155,7 @@ async function extractVidmolyMaster(embedUrl) {
   const referer = `https://${host}/`;
   const html = await (
     await fetch(embedUrl, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Origin: `https://${host}`,
-        Referer: referer,
-        "Sec-Fetch-Dest": "iframe",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
+      headers: { ...browserHeaders(referer), "Sec-Fetch-Dest": "iframe" },
     })
   ).text();
   const block = html.match(/sources:\s*(\[[\s\S]*?\])/);
@@ -165,13 +169,7 @@ async function handleVidmoly(request, path, origin) {
   const ext = await extractVidmolyMaster(embedUrl);
   if (!ext) return new Response(null, { status: 502 });
 
-  const upstream = await fetch(ext.master, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Referer: ext.referer,
-      Origin: new URL(ext.referer).origin,
-    },
-  });
+  const upstream = await fetch(ext.master, { headers: browserHeaders(ext.referer) });
   if (!upstream.ok) return new Response(null, { status: upstream.status });
 
   // master → variantes/segments réécrits vers /hls (fetchés par le Worker,
